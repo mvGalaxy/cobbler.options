@@ -9,16 +9,22 @@ namespace YourNamespace.Services
         private readonly string _apiKey;
         private readonly string? _connStr;
         private readonly JsonSerializerOptions _json;
+        private readonly IntradayVolCalculator _calculator;
         private const string Base = "https://api.massive.com";
 
         /// <param name="apiKey">Massive API key</param>
         /// <param name="sqlConnectionString">SQL Server connection string (optional, pass null to skip persistence)</param>
-        public IntradayVolService(string apiKey, string? sqlConnectionString = null, HttpClient? httpClient = null)
+        public IntradayVolService(
+            string apiKey,
+            string? sqlConnectionString = null,
+            HttpClient? httpClient = null,
+            IntradayVolCalculator? calculator = null)
         {
             _apiKey = apiKey;
             _connStr = sqlConnectionString;
             _http = httpClient ?? new HttpClient();
             _json = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            _calculator = calculator ?? new IntradayVolCalculator();
         }
 
         /// <summary>
@@ -45,132 +51,20 @@ namespace YourNamespace.Services
             int calDays = (int)(rollingDays * 1.6) + 10;
             var fromDate = date.AddDays(-calDays).ToString("yyyy-MM-dd");
             var dailyBars = await GetAggsAsync(ticker, 1, "day", fromDate, dateStr, ct);
-            var orderedDaily = dailyBars.OrderBy(b => b.Timestamp).ToList();
 
-            // 3. Extract today's OHLC from daily bars
-            var todayBar = orderedDaily.LastOrDefault()
-                ?? throw new Exception($"No daily bar found for {ticker} on {dateStr}");
-
-            var prevBar = orderedDaily.Count >= 2
-                ? orderedDaily[orderedDaily.Count - 2]
-                : todayBar;
-
-            // 4. Intraday realized vol from 15-min closes
-            var intradayCloses = intradayBars
-                .OrderBy(b => b.Timestamp)
-                .Select(b => b.Close)
-                .ToArray();
-
-            double intradayVol = VolEstimators.IntradayRealizedVol(intradayCloses);
-
-            // 5. Rolling close-to-close vol
-            var rollingCloses = orderedDaily
-                .TakeLast(rollingDays + 1)
-                .Select(b => b.Close)
-                .ToArray();
-
-            double ccVol = VolEstimators.CloseToClose(rollingCloses);
-
-            // 6. Rolling Parkinson
-            var rollingHL = orderedDaily
-                .TakeLast(rollingDays)
-                .Select(b => (b.High, b.Low))
-                .ToList();
-
-            double pkVol = VolEstimators.Parkinson(rollingHL);
-
-            // 7. Rolling Garman-Klass
-            var rollingOHLC = orderedDaily
-                .TakeLast(rollingDays)
-                .Select(b => (b.Open, b.High, b.Low, b.Close))
-                .ToList();
-
-            double gkVol = VolEstimators.GarmanKlass(rollingOHLC);
-
-            // 8. Rolling Yang-Zhang (needs prev close for overnight return)
-            var yzData = new List<(decimal prevClose, decimal open, decimal high, decimal low, decimal close)>();
-            for (int i = Math.Max(1, orderedDaily.Count - rollingDays); i < orderedDaily.Count; i++)
-            {
-                yzData.Add((
-                    orderedDaily[i - 1].Close,
-                    orderedDaily[i].Open,
-                    orderedDaily[i].High,
-                    orderedDaily[i].Low,
-                    orderedDaily[i].Close
-                ));
-            }
-
-            double yzVol = VolEstimators.YangZhang(yzData);
-
-            // 9. Build result
-            var snapshot = new DailyVolSnapshot
-            {
-                Ticker = ticker,
-                Date = date.Date,
-                OpenPrice = todayBar.Open,
-                HighPrice = todayBar.High,
-                LowPrice = todayBar.Low,
-                ClosePrice = todayBar.Close,
-                PrevClose = prevBar.Close,
-                IntradayRealizedVol = intradayVol,
-                IntradayBarCount = intradayCloses.Length,
-                CloseToCloseVol = ccVol,
-                ParkinsonVol = pkVol,
-                GarmanKlassVol = gkVol,
-                YangZhangVol = yzVol,
-                RollingWindowDays = Math.Min(rollingDays, rollingCloses.Length - 1),
-                DailyParkinsonVar = VolEstimators.ParkinsonDailyVariance(todayBar.High, todayBar.Low),
-                DailyGarmanKlassVar = VolEstimators.GarmanKlassDailyVariance(
-                                          todayBar.Open, todayBar.High, todayBar.Low, todayBar.Close),
-            };
+            // 3..9 Calculate (pure)
+            var snapshot = _calculator.ComputeDailyVolSnapshot(
+                ticker: ticker,
+                date: date,
+                intradayBars: intradayBars,
+                dailyBars: dailyBars,
+                rollingDays: rollingDays);
 
             // 10. Persist if configured
             if (persist && !string.IsNullOrEmpty(_connStr))
                 await SaveToSqlAsync(snapshot, ct);
 
             return snapshot;
-        }
-
-        /// <summary>
-        /// Compute vol snapshots for a date range. Useful for backfilling history.
-        /// </summary>
-        public async Task<List<DailyVolSnapshot>> ComputeVolRangeAsync(
-            string ticker,
-            DateTime from,
-            DateTime to,
-            int rollingDays = 30,
-            bool persist = true,
-            CancellationToken ct = default)
-        {
-            // Get all trading days in range from daily bars
-            var dailyBars = await GetAggsAsync(ticker, 1, "day",
-                from.ToString("yyyy-MM-dd"), to.ToString("yyyy-MM-dd"), ct);
-
-            var tradingDates = dailyBars
-                .OrderBy(b => b.Timestamp)
-                .Select(b => b.Date.Date)
-                .Distinct()
-                .ToList();
-
-            var results = new List<DailyVolSnapshot>();
-
-            foreach (var date in tradingDates)
-            {
-                try
-                {
-                    var snap = await ComputeDailyVolAsync(ticker, date, rollingDays, persist, ct);
-                    results.Add(snap);
-
-                    // Rate limit courtesy — adjust if your plan allows more
-                    await Task.Delay(250, ct);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"Skipping {ticker} {date:yyyy-MM-dd}: {ex.Message}");
-                }
-            }
-
-            return results;
         }
 
         /// <summary>
@@ -182,23 +76,15 @@ namespace YourNamespace.Services
         {
             var today = DateTime.UtcNow.ToString("yyyy-MM-dd");
             var bars = await GetAggsAsync(ticker, 15, "minute", today, today, ct);
-            var closes = bars.OrderBy(b => b.Timestamp).Select(b => b.Close).ToArray();
 
-            double rv = VolEstimators.IntradayRealizedVol(closes);
-            return (rv, rv - currentIV);
+            return _calculator.ComputeIntradayVolVsIV(bars, currentIV);
         }
 
         /// <summary>
         /// Multi-day intraday realized vol: pulls N trading days of 15-min bars,
         /// groups by session, excludes overnight gaps, pools all intra-session returns
-        /// into one annualized vol number. Much more stable than single-day intraday vol.
-        ///
-        /// Example: 30 days × ~25 returns/day = ~750 returns → very stable estimate.
+        /// into one annualized vol number.
         /// </summary>
-        /// <param name="ticker">Stock ticker</param>
-        /// <param name="days">Number of trading days to include (default 30)</param>
-        /// <param name="asOfDate">End date (default today UTC)</param>
-        /// <param name="persist">If true and connStr was provided, saves to SQL</param>
         public async Task<RollingIntradayVolResult> ComputeRollingIntradayVolAsync(
             string ticker,
             int days = 30,
@@ -215,57 +101,62 @@ namespace YourNamespace.Services
             var fromStr = startDate.ToString("yyyy-MM-dd");
             var toStr = endDate.ToString("yyyy-MM-dd");
 
-            // Pull all 15-min bars for the full date range in one API call
-            // Massive returns up to 50,000 results per page (26 bars/day × 30 days = 780, well within limit)
             var allBars = await GetAggsAsync(ticker, 15, "minute", fromStr, toStr, ct);
-
             if (allBars.Count == 0)
                 throw new Exception($"No 15-min bar data for {ticker} from {fromStr} to {toStr}");
 
-            // Group bars by trading date
-            // Massive timestamps are Unix ms → convert to Eastern time for session grouping
             var eastern = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
-            var sessionGroups = allBars
-                .OrderBy(b => b.Timestamp)
-                .GroupBy(b =>
-                {
-                    var utc = DateTimeOffset.FromUnixTimeMilliseconds(b.Timestamp).UtcDateTime;
-                    var et = TimeZoneInfo.ConvertTimeFromUtc(utc, eastern);
-                    return et.Date;
-                })
-                .OrderBy(g => g.Key)
-                .ToList();
 
-            // Take only the last N trading sessions
-            var sessions = sessionGroups
-                .TakeLast(days)
-                .Select(g => (
-                    date: g.Key,
-                    closes: g.OrderBy(b => b.Timestamp).Select(b => b.Close).ToArray()
-                ))
-                .ToList();
-
-            // Compute pooled multi-day vol
-            var (annVol, dailyVar, breakdown) = VolEstimators.MultiDayIntradayVol(sessions);
-
-            var result = new RollingIntradayVolResult
-            {
-                Ticker = ticker,
-                FromDate = sessions.First().date,
-                ToDate = sessions.Last().date,
-                RealizedVol = annVol,
-                TotalReturns = sessions.Sum(s => Math.Max(0, s.closes.Length - 1)),
-                TradingSessions = sessions.Count,
-                AvgBarsPerSession = sessions.Average(s => (double)s.closes.Length),
-                DailyVariance = dailyVar,
-                SessionBreakdown = breakdown,
-            };
+            var result = _calculator.ComputeRollingIntradayVol(
+                ticker: ticker,
+                days: days,
+                allBars: allBars,
+                easternTimeZone: eastern);
 
             // Persist to SQL if configured
             if (persist && !string.IsNullOrEmpty(_connStr))
                 await SaveRollingIntradayToSqlAsync(result, ct);
 
             return result;
+        }
+
+        /// <summary>
+        /// Compute vol snapshots for a date range. Useful for backfilling history.
+        /// </summary>
+        public async Task<List<DailyVolSnapshot>> ComputeVolRangeAsync(
+            string ticker,
+            DateTime from,
+            DateTime to,
+            int rollingDays = 30,
+            bool persist = true,
+            CancellationToken ct = default)
+        {
+            var dailyBars = await GetAggsAsync(ticker, 1, "day",
+                from.ToString("yyyy-MM-dd"), to.ToString("yyyy-MM-dd"), ct);
+
+            var tradingDates = dailyBars
+                .OrderBy(b => b.Timestamp)
+                .Select(b => b.DateUtc)
+                .Distinct()
+                .ToList();
+
+            var results = new List<DailyVolSnapshot>();
+
+            foreach (var date in tradingDates)
+            {
+                try
+                {
+                    var snap = await ComputeDailyVolAsync(ticker, date, rollingDays, persist, ct);
+                    results.Add(snap);
+                    await Task.Delay(250, ct);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Skipping {ticker} {date:yyyy-MM-dd}: {ex.Message}");
+                }
+            }
+
+            return results;
         }
 
         /// <summary>
@@ -452,7 +343,6 @@ namespace YourNamespace.Services
             using var conn = new SqlConnection(_connStr);
             await conn.OpenAsync(ct);
 
-            // Upsert: update if exists, insert if new
             var cmd = new SqlCommand(@"
             MERGE DailyVolSnapshots AS target
             USING (SELECT @Ticker AS Ticker, @Date AS [Date]) AS source
